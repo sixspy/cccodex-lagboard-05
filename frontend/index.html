@@ -59,6 +59,10 @@ createApp({
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const batches=ref([]), batchLedger=ref([]), batchAudit=ref(null), batchMechs=ref({});
+    const batchContention=ref([]), batchDeviation=ref([]);
+    const batchForm=ref({batch_no:'', path:'甲', day:'', declared_rows:null, rows:'订单源,2026-11-18T10:00:00,2026-11-18T10:05:00\n支付源,2026-11-18T10:00:00,2026-11-18T10:05:00'});
+    const batchMsg=ref('');
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
     const nav=['到达登记','滞后分级','补齐恢复'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
@@ -88,6 +92,12 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const b=await loadJson('/api/batch/queue'); if(b===null) return;
+      batches.value=Array.isArray(b.items)?b.items:[]; batchMechs.value=b.mechanisms||{};
+      const bl=await loadJson('/api/batch/ledger'); batchLedger.value=Array.isArray(bl.items)?bl.items:[];
+      const bc=await loadJson('/api/batch/contention'); batchContention.value=Array.isArray(bc.items)?bc.items:[];
+      const bd=await loadJson('/api/batch/deviation'); batchDeviation.value=Array.isArray(bd.items)?bd.items:[];
+      batchAudit.value=await loadJson('/api/batch/audit');
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -97,8 +107,28 @@ createApp({
       await refresh();
     }
     async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    function parseBatchRows(text){
+      return text.split('\n').map(l=>l.trim()).filter(Boolean).map(l=>{
+        const p=l.split(',').map(x=>x.trim());
+        return {source:p[0]||'', source_clock:p[1]||'', ingest_clock:p[2]||''};
+      });
+    }
+    async function submitBatch(){
+      batchMsg.value='';
+      const rows=parseBatchRows(batchForm.value.rows||'');
+      const body={batch_no:batchForm.value.batch_no, path:batchForm.value.path, rows};
+      if(batchForm.value.declared_rows) body.declared_rows=Number(batchForm.value.declared_rows);
+      if(batchForm.value.day) body.day=batchForm.value.day;
+      const r=await fetch('/api/batch/submit',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+      const j=await r.json().catch(()=>({}));
+      if(r.ok) batchMsg.value=`${j.verdict} · ${j.mechanism} · 正式新增 ${j.formal_added} 行`;
+      else batchMsg.value=j.detail||'批量补采被拒';
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup,
+            batches,batchLedger,batchAudit,batchMechs,batchForm,batchMsg,submitBatch,
+            batchContention,batchDeviation};
   },
   template:`
   <div v-if="!token" class="login">
@@ -154,8 +184,50 @@ createApp({
       </div>
       <div class="card" v-show="tab===2">
         <h3>补齐记录</h3>
-        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
-        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>批量批号</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.batch_no||'—'}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+
+        <h3 style="margin-top:22px">批量补采（同败同成）</h3>
+        <p style="color:#64748b;font-size:13px">
+          甲路＝外键同批号整批落账，缺一行两侧拒收、正式侧零新增；乙路＝先入旁路影子批表核对后整批晋升，半成功即清影子、正式行不增。当天只认一本同命运册，不得换路。
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">
+          <div><label>批号</label><input v-model="batchForm.batch_no" placeholder="如 B-20261118-01"/></div>
+          <div><label>路</label><select v-model="batchForm.path"><option value="甲">甲 · 外键同批号</option><option value="乙">乙 · 旁路影子批表</option></select></div>
+          <div><label>业务日（可空＝今天）</label><input v-model="batchForm.day" placeholder="2026-11-18"/></div>
+          <div><label>声明行数（可空＝按到达行）</label><input v-model="batchForm.declared_rows" placeholder="3"/></div>
+        </div>
+        <label>批行（每行：源,源时钟,摄入时钟）</label>
+        <textarea v-model="batchForm.rows" rows="4" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 10px;font-family:monospace"></textarea>
+        <button class="primary" @click="submitBatch">整批提交并落账</button>
+        <div class="err">{{batchMsg}}</div>
+
+        <div style="margin:12px 0;font-size:12px;color:#64748b">
+          当前生效机制：外键同批号 {{batchMechs['外键同批号']||'未启用'}} · 旁路影子批表 {{batchMechs['旁路影子批表']||'未启用'}}
+          <span v-if="batchAudit"> ｜ 五处对齐：{{batchAudit.aligned?'是':'否'}} ｜ 半成功行：{{batchAudit.half_success_rows}}</span>
+        </div>
+        <table><thead><tr><th>批号</th><th>路</th><th>生效机制</th><th>命运</th><th>到/声</th><th>正式新增</th><th>状态</th></tr></thead>
+        <tbody><tr v-for="b in batches" :key="b.batch_no">
+          <td>{{b.batch_no}}</td><td>{{b.path}}</td><td>{{b.effective_mechanism}}</td><td>{{b.same_fate}}</td>
+          <td>{{b.rows_arrived}}/{{b.rows_declared}}</td><td>{{b.formal_added}}</td><td>{{b.status}}</td>
+        </tr></tbody></table>
+        <h3 style="margin-top:18px">批量同命运册（封档）</h3>
+        <table><thead><tr><th>批号</th><th>业务日</th><th>路</th><th>机制</th><th>裁定</th><th>正式新增</th><th>封档时间</th></tr></thead>
+        <tbody><tr v-for="l in batchLedger" :key="l.id">
+          <td>{{l.batch_no}}</td><td>{{l.day}}</td><td>{{l.path}}</td><td>{{l.mechanism}}</td><td>{{l.verdict}}</td><td>{{l.formal_added}}</td><td>{{l.sealed_at}}</td>
+        </tr></tbody></table>
+        <div v-if="batchContention.length||batchDeviation.length" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
+          <div v-if="batchContention.length">
+            <h3>批量补采争用</h3>
+            <table><thead><tr><th>批号</th><th>留痕</th></tr></thead>
+            <tbody><tr v-for="x in batchContention" :key="'c'+x.id"><td>{{x.batch_no}}</td><td>{{x.detail}}</td></tr></tbody></table>
+          </div>
+          <div v-if="batchDeviation.length">
+            <h3>批量偏了</h3>
+            <table><thead><tr><th>批号</th><th>留痕</th></tr></thead>
+            <tbody><tr v-for="x in batchDeviation" :key="'d'+x.id"><td>{{x.batch_no}}</td><td>{{x.detail}}</td></tr></tbody></table>
+          </div>
+        </div>
       </div>
     </main>
   </div>`

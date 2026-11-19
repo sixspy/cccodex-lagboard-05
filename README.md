@@ -32,8 +32,23 @@
 - 补齐整源解冻 vs 按业务日窗口解冻
 - 只认源时钟 vs 双时钟取严
 
-## 启动（一键）
+## 批量补采（同败同成）
 
+同一影子批的批量补采只允许走下列一种写路径，甲、乙不得混用；当天只认一本批量同命运册。
+
+| 路径 | 机制 | 落账口径 |
+|------|------|----------|
+| 甲 | 外键同批号 | 整批到达，正式侧以外键同批号绑定批头；缺一行则两侧拒收，正式侧零新增 |
+| 乙 | 旁路影子批表 | 批行先入旁路影子批表核对行命运，整批晋升；遇半成功则影子批表清空，正式行不增 |
+
+- 入口：前端「补齐恢复」页内的「批量补采（同败同成）」区，不新开批采台；口令沿用本仓批采侧 `admin/123456`。
+- 库：`data/app.db`，同库新增 `batch_queue / batch_shadow / batch_ledger / batch_register / batch_contention / batch_deviation / batch_lock / batch_source_touch / watermarks`。
+- 落板即写批量同命运说明并封档；`batch/queue` 每条标出 `effective_mechanism`（外键同批号 / 旁路影子批表何者生效）。
+- 两路调度交同一补采批须占 `batch_lock`；后交只记「批量补采争用」，禁止重复晋升同一影子批。
+- 补采队列、到达列表、源目录、水位页与对账账册禁止半成功行；`GET /api/batch/audit` 五处对齐校验。
+- 偏离同命运说明（同日换路）即驳回并记「批量偏了」。
+
+## 启动（一键）
 `powershell
 cd projects/06-lagboard
 docker compose up -d --build
